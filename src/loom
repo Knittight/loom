@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+Loom Language Interpreter
+A minimal, readable programming language
+"""
+
+import re
+import sys
+from pathlib import Path
+
+class LoomError(Exception):
+    pass
+
+class Token:
+    def __init__(self, type, value, line):
+        self.type = type
+        self.value = value
+        self.line = line
+
+    def __repr__(self):
+        return f"{self.type}:{self.value}"
+
+# =========================
+# LEXER
+# =========================
+
+class Lexer:
+    def __init__(self, code):
+        self.code = code
+        self.pos = 0
+        self.line = 1
+        self.tokens = []
+    
+    def peek(self, o=0):
+        p = self.pos + o
+        return self.code[p] if p < len(self.code) else None
+
+    def advance(self):
+        if self.peek() == '\n':
+            self.line += 1
+        self.pos += 1
+
+    def tokenize(self):
+        keywords = {
+            'let','const','fn','if','elf','else','for','in',
+            'return','ret','print','p','printv','pv',
+            'import','imp','export','exp',
+            'true','false','mod','break','continue'
+        }
+        # input/inp are handled specially as they're function-like
+        special_keywords = {'input','inp'}
+
+        while self.pos < len(self.code):
+            c = self.peek()
+
+            if c in ' \t\r\n':
+                self.advance()
+                continue
+
+            # comments
+            if c == '/' and self.peek(1) == '/':
+                while self.peek() and self.peek() != '\n':
+                    self.advance()
+                continue
+
+            # library decl /!/
+            if c == '/' and self.peek(1) == '!' and self.peek(2) == '/':
+                self.tokens.append(Token('LIBDECL','/!/',self.line))
+                self.advance(); self.advance(); self.advance()
+                continue
+
+            if c in '"\'':
+                q = c
+                self.advance()
+                s = ""
+                while self.peek() and self.peek() != q:
+                    s += self.peek()
+                    self.advance()
+                if not self.peek():
+                    raise LoomError("Unterminated string")
+                self.advance()
+                self.tokens.append(Token('STRING',s,self.line))
+                continue
+
+            if c.isdigit():
+                num = ""
+                dot = False
+                while self.peek() and (self.peek().isdigit() or self.peek()=='.'):
+                    if self.peek()=='.':
+                        if dot or self.peek(1)=='.':
+                            break
+                        dot=True
+                    num+=self.peek()
+                    self.advance()
+                self.tokens.append(Token('NUMBER',float(num) if dot else int(num),self.line))
+                continue
+
+            if c.isalpha() or c=='_':
+                ident=""
+                while self.peek() and (self.peek().isalnum() or self.peek()=='_'):
+                    ident+=self.peek()
+                    self.advance()
+                # Check if it's a keyword (but input/inp are treated as identifiers that get special handling)
+                if ident in keywords:
+                    t = 'KEYWORD'
+                elif ident in special_keywords:
+                    t = 'IDENT'  # Treat input/inp as identifiers, not keywords
+                else:
+                    t = 'IDENT'
+                self.tokens.append(Token(t,ident,self.line))
+                continue
+
+            two = c + (self.peek(1) or "")
+            if two in ('==','!=','<=','>=','&&','||','..'):
+                self.tokens.append(Token(two,two,self.line))
+                self.advance(); self.advance()
+                continue
+
+            single = {
+                '+','-','*','/','%','=','<','>','!',
+                '(',')','{','}',',','.'
+            }
+            if c in single:
+                self.tokens.append(Token(c,c,self.line))
+                self.advance()
+                continue
+
+            raise LoomError(f"Unexpected character '{c}'")
+
+        self.tokens.append(Token('EOF',None,self.line))
+        return self.tokens
+
+# =========================
+# PARSER
+# =========================
+
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.pos = 0
+
+    @staticmethod
+    def unescape_string(s: str) -> str:
+        """Convert escape sequences like \\n, \\t into actual characters"""
+        return bytes(s, "utf-8").decode("unicode_escape")
+
+    @staticmethod
+    def interpolate(s: str, env: dict) -> str:
+        """Replace ${var} with its value"""
+        def repl(match):
+            name = match.group(1)
+            return str(env.get(name, ""))
+        return re.sub(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, s)
+
+    def cur(self): return self.tokens[self.pos]
+    def adv(self): self.pos+=1
+    def match(self,t,v=None):
+        tok=self.cur()
+        if tok.type!=t or (v is not None and tok.value!=v):
+            raise LoomError(f"Parse error at line {tok.line}: expected {t} {v if v else ''}, got {tok.type}:{tok.value}")
+        self.adv()
+        return tok
+
+    def parse(self):
+        if self.cur().type=='LIBDECL':
+            return self.parse_library()
+        stmts=[]
+        while self.cur().type!='EOF':
+            stmts.append(self.statement())
+        return {'type':'program','body':stmts}
+
+    def parse_library(self):
+        self.match('LIBDECL')
+        name=self.match('IDENT').value
+        funcs=[]
+        exports=[]
+        while self.cur().type!='EOF':
+            if self.cur().value=='fn':
+                funcs.append(self.function())
+            elif self.cur().value in ('export','exp'):
+                self.adv()
+                exports.append(self.match('IDENT').value)
+            else:
+                raise LoomError("Invalid library body")
+        return {'type':'library','name':name,'functions':funcs,'exports':exports}
+
+    def statement(self):
+        tok=self.cur()
+        if tok.value=='let': return self.let_stmt()
+        if tok.value=='fn': return self.function()
+        if tok.value in ('return','ret'):
+            self.adv()
+            return {'type':'return','value':None if self.cur().type in ('}','EOF') else self.expr()}
+        if tok.value=='if': return self.if_stmt()
+        if tok.value=='for': return self.for_stmt()
+        if tok.value in ('print','p','printv','pv'): 
+            return self.print_stmt()
+        if tok.value in ('break','continue'):
+            self.adv()
+            return {'type':tok.value}
+        if tok.value in ('import','imp'):
+            self.adv()
+            return {'type':'import','name':self.match('IDENT').value}
+        # Check for assignment (identifier = expr)
+        if tok.type == 'IDENT':
+            next_tok = self.tokens[self.pos + 1] if self.pos + 1 < len(self.tokens) else None
+            if next_tok and next_tok.type == '=':
+                name = tok.value
+                self.adv()  # skip identifier
+                self.match('=')
+                value = self.expr()
+                return {'type':'assign','name':name,'value':value}
+        return {'type':'expr','expr':self.expr()}
+
+    def let_stmt(self):
+        self.match('KEYWORD','let')
+        is_const=False
+        if self.cur().value=='const':
+            self.adv()
+            is_const=True
+        name=self.match('IDENT').value
+        self.match('=')
+        expr=self.expr()
+        if expr['type']=='scon':
+            raise LoomError("Cannot assign semi-constant")
+        return {'type':'let','name':name,'const':is_const,'value':expr}
+
+    def function(self):
+        self.match('KEYWORD','fn')
+        name=self.match('IDENT').value
+        self.match('(')
+        params=[]
+        while self.cur().type!=')':
+            params.append(self.match('IDENT').value)
+            if self.cur().type==',':
+                self.adv()
+        self.match(')')
+        self.match('{')
+        body=[]
+        while self.cur().type!='}':
+            body.append(self.statement())
+        self.match('}')
+        return {'type':'fn','name':name,'params':params,'body':body}
+
+    def if_stmt(self):
+        self.match('KEYWORD','if')
+        cond=self.expr()
+        self.match('{')
+        then=[]
+        while self.cur().type!='}': then.append(self.statement())
+        self.match('}')
+        elifs=[]
+        while self.cur().value=='elf':
+            self.adv()
+            c=self.expr()
+            self.match('{')
+            b=[]
+            while self.cur().type!='}': b.append(self.statement())
+            self.match('}')
+            elifs.append((c,b))
+        else_body=None
+        if self.cur().value=='else':
+            self.adv()
+            self.match('{')
+            else_body=[]
+            while self.cur().type!='}': else_body.append(self.statement())
+            self.match('}')
+        return {'type':'if','cond':cond,'then':then,'elifs':elifs,'else':else_body}
+
+    def for_stmt(self):
+        self.match('KEYWORD','for')
+        self.match('(')
+        var=self.match('IDENT').value
+        self.match('KEYWORD','in')
+        it=self.expr()
+        self.match(')')
+        self.match('{')
+        body=[]
+        while self.cur().type!='}': body.append(self.statement())
+        self.match('}')
+        return {'type':'for','var':var,'iter':it,'body':body}
+
+    def print_stmt(self):
+        fn=self.cur().value
+        self.adv()
+        self.match('(')
+        args=[]
+        while self.cur().type!=')':
+            args.append(self.expr())
+            if self.cur().type==',':
+                self.adv()
+        self.match(')')
+        return {'type':'print','fn':fn,'args':args}
+
+    # ---------- EXPRESSIONS ----------
+
+    def expr(self): return self.logic_or()
+
+    def logic_or(self):
+        e=self.logic_and()
+        while self.cur().type=='||':
+            op=self.cur().value; self.adv()
+            e={'type':'bin','op':op,'l':e,'r':self.logic_and()}
+        return e
+
+    def logic_and(self):
+        e=self.equality()
+        while self.cur().type=='&&':
+            op=self.cur().value; self.adv()
+            e={'type':'bin','op':op,'l':e,'r':self.equality()}
+        return e
+
+    def equality(self):
+        e=self.compare()
+        while self.cur().type in ('==','!='):
+            op=self.cur().value; self.adv()
+            e={'type':'bin','op':op,'l':e,'r':self.compare()}
+        return e
+
+    def compare(self):
+        e=self.range_expr()
+        while self.cur().type in ('<','>','<=','>='):
+            op=self.cur().value; self.adv()
+            e={'type':'bin','op':op,'l':e,'r':self.range_expr()}
+        return e
+
+    def range_expr(self):
+        e=self.term()
+        if self.cur().type=='..':
+            self.adv()
+            return {'type':'range','s':e,'e':self.term()}
+        return e
+
+    def term(self):
+        e=self.factor()
+        while self.cur().type in ('+','-'):
+            op=self.cur().value; self.adv()
+            e={'type':'bin','op':op,'l':e,'r':self.factor()}
+        return e
+
+    def factor(self):
+        e=self.unary()
+        while self.cur().type in ('*','/'):
+            op=self.cur().value; self.adv()
+            e={'type':'bin','op':op,'l':e,'r':self.unary()}
+        return e
+
+    def unary(self):
+        if self.cur().type in ('-','!'):
+            op=self.cur().value; self.adv()
+            return {'type':'un','op':op,'v':self.unary()}
+        return self.postfix()
+
+    def postfix(self):
+        e=self.primary()
+        
+        # Handle %, function calls, and member access in a single loop
+        while True:
+            if self.cur().type=='%':
+                self.adv()
+                e={'type':'percent','v':e}
+            elif self.cur().type=='(':
+                self.adv()
+                args=[]
+                while self.cur().type!=')':
+                    args.append(self.expr())
+                    if self.cur().type==',':
+                        self.adv()
+                self.match(')')
+                e={'type':'call','f':e,'args':args}
+            elif self.cur().type=='.':
+                self.adv()
+                e={'type':'member','o':e,'m':self.match('IDENT').value}
+            else:
+                break
+        
+        return e
+
+    def primary(self):
+        t=self.cur()
+        if t.type=='NUMBER': self.adv(); return {'type':'num','v':t.value}
+        if t.type == 'STRING':
+            self.adv()
+            raw = t.value
+            return {'type':'str','v':self.unescape_string(raw)}
+        if t.value=='true': self.adv(); return {'type':'bool','v':True}
+        if t.value=='false': self.adv(); return {'type':'bool','v':False}
+        if t.type=='IDENT' and t.value in ('input','inp'):
+            self.adv()
+            self.match('(')
+            prompt = None
+            if self.cur().type != ')':
+                prompt = self.expr()
+            self.match(')')
+            return {'type':'input','prompt':prompt}
+        if t.type=='IDENT':
+            self.adv()
+            return {'type':'id','v':t.value}
+        if t.type=='(':
+            self.adv()
+            e=self.expr()
+            self.match(')')
+            return e
+        raise LoomError("Invalid expression")
+
+# =========================
+# INTERPRETER
+# =========================
+
+class Interpreter:
+    def __init__(self):
+        self.globals={}
+        self.scopes=[{}]
+        self.funcs={}
+        self.libs={}
+        self.ret=None
+        self.break_f=False
+        self.cont_f=False
+
+    def run(self,ast):
+        if ast['type']=='library':
+            return self.load_lib_ast(ast)
+        for s in ast['body']:
+            self.exec(s)
+
+    def exec(self,s):
+        if self.ret is not None or self.break_f or self.cont_f:
+            return
+        t=s['type']
+        if t=='let':
+            self.scopes[-1][s['name']]={'v':self.eval(s['value']),'c':s['const']}
+        elif t=='assign':
+            # Find the variable in scopes and update it
+            name = s['name']
+            value = self.eval(s['value'])
+            for scope in reversed(self.scopes):
+                if name in scope:
+                    if scope[name]['c']:
+                        raise LoomError(f"Cannot reassign const variable {name}")
+                    scope[name]['v'] = value
+                    return
+            if name in self.globals:
+                if self.globals[name]['c']:
+                    raise LoomError(f"Cannot reassign const variable {name}")
+                self.globals[name]['v'] = value
+                return
+            raise LoomError(f"Undefined variable {name}")
+        elif t=='fn':
+            self.funcs[s['name']]=s
+        elif t=='return':
+            self.ret=self.eval(s['value']) if s['value'] else None
+        elif t=='print':
+            out=[]
+            for a in s['args']:
+                v=self.eval(a)
+                if s['fn'] in ('printv','pv') and isinstance(v,str):
+                    v=self.interpolate(v)
+                out.append(str(v))
+            print(''.join(out),end='\n')
+        elif t=='if':
+            if self.truth(self.eval(s['cond'])):
+                for x in s['then']: self.exec(x)
+            else:
+                done=False
+                for c,b in s['elifs']:
+                    if self.truth(self.eval(c)):
+                        for x in b: self.exec(x)
+                        done=True; break
+                if not done and s['else']:
+                    for x in s['else']: self.exec(x)
+        elif t=='for':
+            it=self.eval(s['iter'])
+            self.scopes.append({})
+            for v in it:
+                self.scopes[-1][s['var']]={'v':v,'c':False}
+                for x in s['body']:
+                    self.exec(x)
+                    if self.cont_f:
+                        self.cont_f=False
+                        break
+                    if self.break_f or self.ret is not None:
+                        break
+                if self.break_f or self.ret is not None:
+                    break
+            self.scopes.pop()
+            self.break_f=False
+        elif t=='break': self.break_f=True
+        elif t=='continue': self.cont_f=True
+        elif t=='import': self.import_lib(s['name'])
+        elif t=='expr': self.eval(s['expr'])
+
+    def eval(self,e):
+        t=e['type']
+        if t=='num': return e['v']
+        if t=='str': return e['v']
+        if t=='bool': return e['v']
+        if t=='scon': return float('inf') if e['v']=='i' else 3.141592653589793
+        if t=='id': return self.lookup(e['v'])
+        if t=='percent': return self.eval(e['v'])/100
+        if t=='input':
+            prompt_text = ''
+            if e['prompt']:
+                prompt_val = self.eval(e['prompt'])
+                prompt_text = str(prompt_val)
+            return input(prompt_text)
+        if t=='bin':
+            op=e['op']
+            l=self.eval(e['l']); r=self.eval(e['r'])
+            # Handle string concatenation
+            if op=='+' and (isinstance(l,str) or isinstance(r,str)):
+                return str(l)+str(r)
+            # Handle comparison and logical operators
+            if op=='==': return l==r
+            if op=='!=': return l!=r
+            if op=='<': return l<r
+            if op=='>': return l>r
+            if op=='<=': return l<=r
+            if op=='>=': return l>=r
+            if op=='&&': return self.truth(l) and self.truth(r)
+            if op=='||': return self.truth(l) or self.truth(r)
+            # Handle arithmetic operators
+            return {
+                '+':l+r,'-':l-r,'*':l*r,'/':l/r
+            }[op]
+        if t=='un':
+            v=self.eval(e['v'])
+            return -v if e['op']=='-' else not self.truth(v)
+        if t=='range':
+            return range(int(self.eval(e['s'])),int(self.eval(e['e']))+1)
+        if t=='call':
+            f=self.eval(e['f'])
+            args=[self.eval(a) for a in e['args']]
+            if isinstance(f,dict) and f.get('type')=='libfunc':
+                return self.call_lib_func(f['lib'],f['name'],args)
+            return self.call_func(f,args)
+        if t=='member':
+            o=self.eval(e['o'])
+            if isinstance(o,dict) and o.get('type')=='lib':
+                # Return a reference to the library function
+                return {'type':'libfunc','lib':o['lib'],'name':e['m']}
+            raise LoomError(f"Cannot access member {e['m']}")
+        raise LoomError("Invalid eval")
+
+    def lookup(self,n):
+        for s in reversed(self.scopes):
+            if n in s: return s[n]['v']
+        if n in self.globals: return self.globals[n]['v']
+        if n in self.funcs: return n
+        if n in ('tostring','tstr','toint','tint','tofloat','tof'): return n
+        raise LoomError(f"Undefined {n}")
+
+    def truth(self,v): return bool(v)
+
+    def call_func(self,name,args):
+        # Built-in functions
+        if name in ('tostring','tstr'):
+            return str(args[0]) if args else ''
+        if name in ('toint','tint'):
+            return int(args[0]) if args else 0
+        if name in ('tofloat','tof'):
+            return float(args[0]) if args else 0.0
+
+    def call_lib_func(self,lib,name,args):
+        if name not in lib['functions']:
+            raise LoomError(f"Function {name} not exported from library {lib['name']}")
+        
+        # Save current state
+        old_funcs = self.funcs
+        old_globals = self.globals
+        
+        # Load library functions into current scope
+        self.funcs = {**self.funcs, **{f['name']:f for f in lib['functions'].values()}}
+        
+        # Call the function
+        result = self.call_func(name, args)
+        
+        # Restore state
+        self.funcs = old_funcs
+        self.globals = old_globals
+        
+        return result
+
+    def interpolate(self,s):
+        def r(m):
+            return str(self.eval(Parser(Lexer(m.group(1)).tokenize()).expr()))
+        return re.sub(r'\$\{([^}]+)\}',r,s)
+
+    def import_lib(self,name):
+        if name in self.libs:
+            # Already imported, just add to current scope
+            self.scopes[-1][name]={'v':{'type':'lib','lib':self.libs[name]},'c':True}
+            return
+            
+        path=Path(f"{name}.lml")
+        if not path.exists():
+            raise LoomError(f"Library not found: {name}.lml (looking in {Path.cwd()})")
+        code=path.read_text()
+        ast=Parser(Lexer(code).tokenize()).parse()
+        
+        if ast['type'] != 'library':
+            raise LoomError(f"{name}.lml is not a valid library file")
+            
+        lib=self.load_lib_ast(ast)
+        self.libs[name]=lib
+        self.scopes[-1][name]={'v':{'type':'lib','lib':lib},'c':True}
+
+    def load_lib_ast(self,ast):
+        funcs={}
+        for f in ast['functions']:
+            if f['name'] in ast['exports']:
+                funcs[f['name']]=f
+        return {'name':ast['name'],'functions':funcs}
+
+# =========================
+# RUNNER
+# =========================
+
+def run_loom(file):
+    try:
+        code=Path(file).read_text()
+        tokens = Lexer(code).tokenize()
+        ast=Parser(tokens).parse()
+        Interpreter().run(ast)
+    except LoomError as e:
+        print(f"LoomError: {e}")
+        sys.exit(1)
+
+if __name__=="__main__":
+    if len(sys.argv)<2:
+        print("usage: loom <file.lm>")
+        sys.exit(1)
+    run_loom(sys.argv[1])
