@@ -5,14 +5,6 @@ set -e
 
 echo "Installing Loom system-wide..."
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then 
-    echo "This script needs sudo access to install system-wide"
-    echo "Re-running with sudo..."
-    sudo "$0" "$@"
-    exit $?
-fi
-
 INSTALL_DIR="/usr/local/lib/loom"
 BIN_DIR="/usr/local/bin"
 
