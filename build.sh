@@ -3,12 +3,12 @@
 
 set -e
 
-echo "🧵 Installing Loom system-wide..."
+echo "Installing Loom system-wide..."
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then 
-    echo "⚠️  This script needs sudo access to install system-wide"
-    echo "   Re-running with sudo..."
+    echo "This script needs sudo access to install system-wide"
+    echo "Re-running with sudo..."
     sudo "$0" "$@"
     exit $?
 fi
@@ -17,16 +17,16 @@ INSTALL_DIR="/usr/local/lib/loom"
 BIN_DIR="/usr/local/bin"
 
 # Create installation directory
-echo "📁 Creating installation directory..."
-mkdir -p "$INSTALL_DIR"
+echo "Creating installation directory..."
+sudo mkdir -p "$INSTALL_DIR"
 
 # Copy the interpreter
-echo "📋 Copying Loom interpreter..."
-cp main.py "$INSTALL_DIR/loom.py"
-chmod +x "$INSTALL_DIR/loom.py"
+echo "Copying Loom interpreter..."
+sudo cp main.py "$INSTALL_DIR/loom.py"
+sudo chmod +x "$INSTALL_DIR/loom.py"
 
 # Create wrapper script
-echo "🔧 Creating loom command..."
+echo "Creating loom command..."
 cat > "$BIN_DIR/loom" << 'EOF'
 #!/bin/bash
 # Loom interpreter wrapper
@@ -46,15 +46,15 @@ EOF
 chmod +x "$BIN_DIR/loom"
 
 echo ""
-echo "✅ Loom installed successfully!"
+echo "Loom installed successfully!"
 echo ""
-echo "📍 Installation locations:"
+echo "Installation locations:"
 echo "   Library: $INSTALL_DIR/loom.py"
 echo "   Command: $BIN_DIR/loom"
 echo ""
-echo "🎉 You can now run:"
+echo "You can now run:"
 echo "   loom myprogram.lm     # From anywhere!"
 echo ""
-echo "💡 Test it:"
+echo "Test it:"
 echo "   echo 'print(\"Hello, Loom!\")' > test.lm"
 echo "   loom test.lm"
