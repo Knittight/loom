@@ -14,7 +14,7 @@ sudo mkdir -p "$INSTALL_DIR"
 
 # Copy the interpreter
 echo "Copying Loom interpreter..."
-sudo cp main.py "$INSTALL_DIR/loom.py"
+sudo cp src/loom "$INSTALL_DIR/loom.py"
 sudo chmod +x "$INSTALL_DIR/loom.py"
 
 # Create wrapper script
